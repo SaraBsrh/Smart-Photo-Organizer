@@ -70,7 +70,7 @@ def render_image_grid(image_paths, cols=5, thumb_w=200):
         col = columns[i % cols]
         try:
             with Image.open(img_path) as im:
-                col.image(im, use_column_width=True)
+                col.image(im, use_container_width=True)
         except Exception:
             col.write(f"Failed to open {img_path}")
 
@@ -130,7 +130,7 @@ elif page == "Upload & Organize":
                     organized = organize_photos(photo_dir=SAMPLE_PHOTO_DIR, output_dir=out_dir, run_detection=run_detection, force_detection=force_detection)
                 st.success("Organization complete!")
                 st.write(f"Output saved to: `{out_dir}`")
-                st.experimental_set_query_params(last_output=str(out_dir))
+                st.query_params.from_dict({"last_output": str(out_dir)})
                 # show top-level folders
                 st.subheader("Folders created")
                 for folder in sorted(out_dir.iterdir()):
@@ -302,7 +302,7 @@ elif page == "Search Organized":
                 for i, entry in enumerate(matches):
                     try:
                         with Image.open(entry["copied_path"]) as im:
-                            cols[i % 5].image(im, use_column_width=True, caption=Path(entry["copied_path"]).name)
+                            cols[i % 5].image(im, use_container_width=True, caption=Path(entry["copied_path"]).name)
                     except Exception:
                         cols[i % 5].write("Unable to open image.")
 
