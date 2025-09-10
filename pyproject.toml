@@ -1,0 +1,32 @@
+[project]
+name = "smart-photo-organizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "clip>=0.2.0",
+    "exifread>=3.4.0",
+    "ftfy>=6.3.1",
+    "geopy>=2.4.1",
+    "jalali>=1.2",
+    "matplotlib>=3.10.5",
+    "numpy>=2.3.2",
+    "opencv-python>=4.11.0.86",
+    "persiantools>=5.3.0",
+    "pillow>=11.3.0",
+    "rapidfuzz>=3.13.0",
+    "regex>=2025.7.34",
+    "requests>=2.32.4",
+    "retina-face>=0.0.17",
+    "scikit-image>=0.25.2",
+    "tensorflow>=2.20.0",
+    "tf-keras>=2.20.1",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.55.0",
+]
+
+[tool.uv.sources]
+clip = { git = "https://github.com/openai/CLIP.git" }
