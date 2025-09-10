@@ -1,0 +1,26 @@
+/Applications/portfolio-projects/smart-photo-organizer/data/sample-data.zip
+/Applications/portfolio-projects/smart-photo-organizer/data/sample-data
+# Virtual environment
+.venv/
+
+# OS cache files
+.DS_Store
+
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files or large binaries
+*.zip
+*.tar
+*.pth
+*.pt
+*.onnx
+*.so
+*.dylib
+
+# IDE/project files
+.vscode/
+.idea/
