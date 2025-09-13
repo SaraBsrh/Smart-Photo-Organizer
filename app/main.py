@@ -1,9 +1,4 @@
-"""
-Organize user-uploaded photos end-to-end.
-
-Exposes:
-    organize_photos(photo_dir, output_dir, run_detection=True, force_detection=False)
-"""
+# (keep the same module docstring and imports you already have)
 from pathlib import Path
 import json
 import shutil
@@ -30,14 +25,13 @@ DATE_FORMAT = "%Y-%m-%d"
 DAYS_THRESHOLD = 4
 
 # ---------------- Robust imports (optional helpers) ----------------
-# Try to import user-provided helpers if available; fall back otherwise.
 try:
     from app.utils.scene_tags import add_scene_tags as _add_scene_tags
 except Exception:
     try:
         from utils.scene_tags import add_scene_tags as _add_scene_tags
     except Exception:
-        _add_scene_tags = None  # fallback later
+        _add_scene_tags = None
 
 try:
     from app.utils.geocode import add_locations_to_metadata as _add_locations_to_metadata
@@ -47,7 +41,6 @@ except Exception:
     except Exception:
         _add_locations_to_metadata = None
 
-# Try to import extract_metadata_from and make_serializable if provided by utils.metadata
 _extract_meta = None
 _make_serializable_external = None
 try:
@@ -60,7 +53,6 @@ except Exception:
         _extract_meta = _ext_meta
         _make_serializable_external = _ms_ext
     except Exception:
-        # will use fallback extractor and internal serializer
         _extract_meta = None
         _make_serializable_external = None
 
@@ -165,43 +157,41 @@ def group_by_date(date_dict: Dict[str, Any], days_threshold: int = DAYS_THRESHOL
     return groups
 
 def sanitize_folder_name(s: str) -> str:
+    """
+    Sanitize a single component for folder naming.
+    Replaces commas with '-', slashes/backslashes/colons with '-', collapses whitespace to underscores,
+    limits length.
+    """
     s = s.strip()
-    s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
+    # replace separators and punctuation that would confuse naming
+    s = s.replace("/", "-").replace("\\", "-").replace(":", "-").replace(",", "-")
     s = re.sub(r"\s+", "_", s)
+    # remove repeated hyphens or underscores
+    s = re.sub(r"[_\-]{2,}", lambda m: m.group(0)[0], s)
     return s[:200]
 
 # ---------------- JSON sanitizer ----------------
 def make_serializable(obj):
-    """
-    Convert common non-json types to JSON-friendly primitives.
-    Handles IFDRational (Pillow), Fraction, numpy scalars/arrays, datetime, Path, tuples, sets, bytes.
-    """
-    # if external serializer exists prefer it
     if _make_serializable_external:
         try:
             return _make_serializable_external(obj)
         except Exception:
             pass
 
-    # None / basic
     if obj is None:
         return None
     if isinstance(obj, (str, bool)):
         return obj
     if isinstance(obj, numbers.Number):
-        # ints and floats
         return obj
     if _np is not None and isinstance(obj, _np.generic):
         return obj.item()
     if isinstance(obj, Fraction):
         return float(obj)
-    # datetime
     if isinstance(obj, datetime):
         return obj.isoformat()
-    # Path
     if isinstance(obj, Path):
         return str(obj)
-    # dict
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -211,24 +201,19 @@ def make_serializable(obj):
                 ks = repr(k)
             out[ks] = make_serializable(v)
         return out
-    # list/tuple/set
     if isinstance(obj, (list, tuple, set)):
         return [make_serializable(x) for x in obj]
-    # numpy array
     if _np is not None and hasattr(_np, "ndarray") and isinstance(obj, _np.ndarray):
         return [make_serializable(x) for x in obj.tolist()]
-    # bytes
     if isinstance(obj, (bytes, bytearray)):
         try:
             return obj.decode(errors="ignore")
         except Exception:
             return str(obj)
-    # Pillow IFDRational / similar: try float conversion
     try:
         return float(obj)
     except Exception:
         pass
-    # fallback to str
     try:
         return str(obj)
     except Exception:
@@ -251,7 +236,6 @@ def extract_metadata_fallback(photo_dir: Path) -> Dict[str, Any]:
 
     def _gps_to_decimal(gps):
         try:
-            # gps might be ([(deg_num,deg_den),...], ref) or (deg, min, sec) objects
             coords, ref = gps
             d = coords[0]
             m = coords[1]
@@ -301,10 +285,9 @@ def extract_metadata_fallback(photo_dir: Path) -> Dict[str, Any]:
             "lat": lat,
             "lon": lon,
         }
-    # sanitize before returning
     return {k: make_serializable(v) for k, v in out.items()}
 
-# ---------------- Main pipeline ----------------
+# ---------------- Main pipeline (updated) ----------------
 def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_detection: bool = True, force_detection: bool = False):
     photo_dir = Path(photo_dir)
     output_dir = Path(output_dir)
@@ -315,22 +298,19 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
     try:
         if _extract_meta:
             metadata = _extract_meta(str(photo_dir))
-            # If external make_serializable exists, use it; otherwise use local sanitizer
             metadata = {k: (_make_serializable_external(v) if _make_serializable_external else make_serializable(v)) for k, v in metadata.items()}
         else:
             metadata = extract_metadata_fallback(photo_dir)
     except Exception:
-        # fallback safe extractor
         metadata = extract_metadata_fallback(photo_dir)
 
-    # Save basic date metadata (sanitized)
+    # Save basic date metadata
     date_file = output_dir / "metadata.json"
     with open(date_file, "w", encoding="utf-8") as f:
         json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
 
     # 2) Add locations
     if _add_locations_to_metadata:
-        # try calling with (metadata, photo_dir) then fallback to (metadata,)
         try:
             metadata = _add_locations_to_metadata(metadata, photo_dir)
         except TypeError:
@@ -345,14 +325,12 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
     with open(location_file, "w", encoding="utf-8") as f:
         json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
 
-    # 3) Add scene tags
+    # 3) Add scene tags - ensure result is written to organized_output/metadata_with_tags.json
+    tags_file = output_dir / "metadata_with_tags.json"
     if _add_scene_tags:
         try:
-            metadata = _add_scene_tags(
-                metadata,
-                photo_dir,
-                save_path=output_dir / "metadata_with_tags.json"
-            )
+            # prefer that the scene tagger writes to our output folder
+            metadata = _add_scene_tags(metadata, photo_dir, save_path=tags_file)
         except Exception as e:
             print(f"⚠️ _add_scene_tags failed: {e}. Will try to load tags JSON if available.")
 
@@ -364,42 +342,47 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
             else:
                 metadata[k] = {"datetime": v, "tags": []}
 
-    # Path where we will write final tags JSON
-    tags_file = output_dir / "metadata_with_tags.json"
-
     # Write a best-effort intermediate tags file (serializable)
-    with open(tags_file, "w", encoding="utf-8") as f:
-        json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
+    try:
+        with open(tags_file, "w", encoding="utf-8") as f:
+            json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
+    except Exception:
+        # if writing fails, ignore (we'll still try to load any existing file)
+        pass
 
-    # --- Merge external tags if scene_tags.py (or other process) wrote a tags file ---
-    # Check both source folder and output folder for possible external tags JSON
-    candidates = [photo_dir / "metadata_with_tags.json", tags_file]
-    for candidate in candidates:
-        if candidate.exists():
-            try:
-                with open(candidate, "r", encoding="utf-8") as tf:
-                    ext_map = json.load(tf)
-                # ext_map expected: { "IMG_001.jpg": ["beach","trip"], ... } OR maybe same shape as metadata
-                # Merge: coerce tags to list, and place into metadata[filename]["tags"]
+    # --- Prefer organized_output/metadata_with_tags.json as canonical metadata if available ---
+    if tags_file.exists():
+        try:
+            with open(tags_file, "r", encoding="utf-8") as tf:
+                ext_map = json.load(tf)
+            # If the external map looks like full metadata (values are dicts) replace metadata
+            if isinstance(ext_map, dict) and all(isinstance(v, dict) for v in ext_map.values()):
+                # ensure each entry has 'tags' field
+                for k, v in ext_map.items():
+                    if isinstance(v, dict):
+                        v.setdefault("tags", [])
+                metadata = ext_map
+            else:
+                # ext_map likely mapping fname -> tags list OR fname -> { 'tags': [...] }
                 for fname, tags in ext_map.items():
                     if tags is None:
                         continue
                     if isinstance(tags, dict):
-                        # if ext_map uses full metadata entries, extract 'tags' key
-                        tags = tags.get("tags", [])
-                    if not isinstance(tags, list):
-                        tags = [tags]
+                        t = tags.get("tags", [])
+                    else:
+                        t = tags
+                    if not isinstance(t, list):
+                        t = [t]
                     entry = metadata.get(fname)
                     if entry is None:
-                        metadata[fname] = {"datetime": None, "tags": tags}
+                        metadata[fname] = {"datetime": None, "tags": t}
                     else:
                         if not isinstance(entry, dict):
-                            metadata[fname] = {"datetime": entry, "tags": tags}
+                            metadata[fname] = {"datetime": entry, "tags": t}
                         else:
-                            # overwrite or set tags for this entry
-                            entry["tags"] = tags
-            except Exception as e:
-                print(f"⚠️ Failed to merge tags from {candidate}: {e}")
+                            entry["tags"] = t
+        except Exception as e:
+            print(f"⚠️ Failed to load/merge tags from {tags_file}: {e}")
 
     # Final sanity: ensure every metadata entry is a dict with a tags list
     for k, v in list(metadata.items()):
@@ -409,10 +392,12 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
         else:
             metadata[k] = {"datetime": v, "tags": []}
 
-    # Write final merged tags file (single canonical place)
-    with open(tags_file, "w", encoding="utf-8") as f:
-        json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
-
+    # Persist the final metadata_with_tags.json (canonical)
+    try:
+        with open(tags_file, "w", encoding="utf-8") as f:
+            json.dump(make_serializable(metadata), f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
     # 4) Run object detection if requested
     object_map = {}
@@ -422,7 +407,6 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
             obj_json_path = output_dir / "object_detection_results.json"
             rc, out, err = run_script(obj_script, [str(photo_dir), str(obj_json_path)])
             if rc != 0:
-                # fallback try without args
                 rc2, o2, e2 = run_script(obj_script, [])
             if obj_json_path.exists():
                 try:
@@ -443,7 +427,6 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
             rc, out, err = run_script(face_script, [str(photo_dir), str(faces_out_dir)])
             if rc != 0:
                 rc2, o2, e2 = run_script(face_script, [])
-            # collect face crops
             fm = defaultdict(list)
             for p in faces_out_dir.iterdir():
                 if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png"):
@@ -457,7 +440,7 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
         else:
             face_map = {}
 
-    # 6) Group by date & build organized folders
+    # 6) Group by date & build organized folders (unchanged grouping logic)
     groups = group_by_date({fn: metadata.get(fn, {}).get("datetime") if isinstance(metadata.get(fn), dict) else metadata.get(fn) for fn in metadata})
     organized = {}
 
@@ -478,27 +461,31 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
                     locs.append(loc)
         location = Counter(locs).most_common(1)[0][0] if locs else None
 
-        # tags -> most common
+        # tags -> most common across all photos in the group
         tag_candidates = []
-        per_photo_tags = []
         for p in photos:
             info = metadata.get(p, {})
             if isinstance(info, dict):
                 tags = info.get("tags") or info.get("tag") or []
                 if isinstance(tags, str):
                     tags = [tags]
-                    
                 tag_candidates.extend(tags)
         tag = Counter(tag_candidates).most_common(1)[0][0] if tag_candidates else None
 
-        parts = []
+        # Build folder name as [TAG]-[LOCATION]-[DATE] (omit missing pieces)
+        name_parts = []
         if tag:
-            parts.append(sanitize_folder_name(tag))
+            name_parts.append(sanitize_folder_name(tag))
         if location:
-            parts.append(sanitize_folder_name(location))
+            name_parts.append(sanitize_folder_name(location))
         if group_date_str:
-            parts.append(group_date_str)
-        folder_name = "_".join(parts) if parts else f"group_{gi}_{group_date_str or 'unknown'}"
+            name_parts.append(group_date_str)
+        # Join with hyphen exactly as requested
+        if name_parts:
+            folder_name = "-".join(name_parts)
+        else:
+            folder_name = f"group_{gi}_{group_date_str or 'unknown'}"
+
         folder_path = output_dir / folder_name
         suffix = 1
         base_folder_path = folder_path
@@ -529,8 +516,8 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
                 "copied_path": str(dst),
                 "date": parsed_dt.strftime(DATE_FORMAT) if parsed_dt else None,
                 "location": location or "",
-                "group_tag": tag,                     # most common tag for the group
-                "tags": info.get("tags", []),         # keep per-photo scene tags
+                "group_tag": tag,
+                "tags": info.get("tags", []),
                 "objects": objects,
                 "faces_count": faces_count,
                 "face_crops": faces,
@@ -546,20 +533,3 @@ def organize_photos(photo_dir, output_dir: Path | str = DEFAULT_OUTPUT_DIR, run_
         json.dump(metadataa, f, indent=2, ensure_ascii=False)
 
     return output_dir
-    return metadataa
-
-def load_organized_metadata(output_dir=DEFAULT_OUTPUT_DIR):
-    organized_file = Path(output_dir) / "organized_metadata.json"
-    if organized_file.exists():
-        with open(organized_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-# ---------------- CLI ----------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("photo_dir", nargs="?", default=".", help="Folder of photos")
-    parser.add_argument("--out", "-o", default=str(DEFAULT_OUTPUT_DIR), help="Output folder")
-    args = parser.parse_args()
-    organize_photos(args.photo_dir, args.out)
