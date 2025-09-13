@@ -7,9 +7,7 @@
 # import cv2
 
 # # --- Paths ---
-# faces_detected_dir = Path("/Users/sara/Desktop/backed-data/faces_detected")   # cropped faces (from RetinaFace)
-# faces_clustered_dir = Path("/Users/sara/Desktop/backed-data/faces_clustered") # clustered output
-# faces_clustered_dir.mkdir(exist_ok=True)
+####
 
 # # --- Load ArcFace (ONNX model) ---
 # app = FaceAnalysis(name="buffalo_l")  # buffalo_l = strong ArcFace model

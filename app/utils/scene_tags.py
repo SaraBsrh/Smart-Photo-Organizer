@@ -1,232 +1,381 @@
-# scene_tags.py (fixed)
-import json
+"""
+scene_tags.py
+
+Provides:
+ - add_scene_tags(metadata, photo_dir, topk=5, save_path=None)
+ - CLI to run standalone and write organized_output/metadata_with_tags.json
+
+Notes:
+ - Heavy ML models are loaded lazily (only when first tagging happens),
+   so importing this module is cheap and safe for main.py.
+"""
 from pathlib import Path
+import json
+from typing import Dict, Any, List, Tuple
+import sys
+import traceback
 import torch
-import clip
-import os
-from typing import Dict, Any, Tuple, List
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, ColorJitter
-from PIL import Image
-from rapidfuzz import process
 
-MODEL_PATH = Path(os.getenv("MODEL_PATH", "data/models/wideresnet18_places365.pth.tar"))
+# --- Configuration (adjust paths as needed) ---
+UPLOAD_DIR = Path("/Applications/portfolio-projects/smart-photo-organizer/uploaded_photos")
+OUTPUT_DIR = Path("/Applications/portfolio-projects/smart-photo-organizer/organized_output")
+DEFAULT_OUTPUT_FILE = OUTPUT_DIR / "metadata_with_tags.json"
+METADATA_FILE_PREF = OUTPUT_DIR / "metadata.json"   # preferred base metadata produced by main.py
 
-# Load places365 categories
-_cat_file = Path("/Applications/portfolio-projects/smart-photo-organizer/app/utils")
-if not _cat_file.exists():
-    raise FileNotFoundError(f"categories_places365.txt not found at {_cat_file}")
-with open(_cat_file, "r", encoding="utf-8") as f:
-    places365_classes = [line.strip().split(' ')[0][3:] for line in f.readlines()]
+# ----------------- Lazy ML imports / initialization -----------------
+# We perform heavy imports only when needed to avoid startup cost when main.py imports this module.
+_models_initialized = False
 
-# Load Places365 model (CPU)
-model_places = models.resnet18(num_classes=365)
-checkpoint = torch.load(MODEL_PATH, map_location="cpu")
-state_dict = {k.replace("module.", ""): v for k, v in checkpoint["state_dict"].items()}
-model_places.load_state_dict(state_dict)
-model_places.eval()
+# placeholders for models / transforms
+_model_places = None
+_places_classes = None
+_places_transform = None
 
-# Image transform pipeline for Places365
-places365_transform = Compose([
-    Resize(256),
-    CenterCrop(224),
-    ColorJitter(brightness=0.2, contrast=0.2),
-    ToTensor(),
-    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+_model_clip = None
+_clip_preprocess = None
+_clip_device = None
 
-def transform_image_places365(image_path: str):
-    image = Image.open(image_path).convert("RGB")
-    return places365_transform(image).unsqueeze(0)  # CPU tensor
+# you can change this path to your Places365 model if needed
+MODEL_PATH = "/Applications/portfolio-projects/smart-photo-organizer/models/wideresnet18_places365.pth.tar"
+PLACES_CLASSES_PATH = "/Applications/portfolio-projects/smart-photo-organizer/app/utils/categories_places365.txt"
 
-def predict_places365(image_tensor, topk=5):
+# We'll import ML packages only inside initializer
+def _init_models():
+    global _models_initialized
+    global _model_places, _places_classes, _places_transform
+    global _model_clip, _clip_preprocess, _clip_device
+
+    if _models_initialized:
+        return
+
+    try:
+        import torch
+        import torch.nn.functional as F
+        import torchvision.models as models
+        from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, ColorJitter
+        from PIL import Image
+        import clip
+        # load Places365 classes file if present
+        places365_classes = []
+        try:
+            with open(PLACES_CLASSES_PATH, "r", encoding="utf-8") as f:
+                places365_classes = [line.strip().split(' ')[0][3:] for line in f.readlines()]
+        except Exception:
+            # fallback: empty list (we'll still run CLIP if available)
+            places365_classes = []
+
+        # Places model
+        try:
+            model_places = models.resnet18(num_classes=365)
+            checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+            state_dict = {k.replace("module.", ""): v for k, v in checkpoint["state_dict"].items()}
+            model_places.load_state_dict(state_dict)
+            model_places.eval()
+            # simple transform
+            places_transform = Compose([
+                Resize(256),
+                CenterCrop(224),
+                ColorJitter(brightness=0.2, contrast=0.2),
+                ToTensor(),
+                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        except Exception:
+            model_places = None
+            places_transform = None
+
+        # CLIP
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_clip, preprocess_clip = clip.load("ViT-B/32", device=device)
+        except Exception:
+            model_clip = None
+            preprocess_clip = None
+            device = "cpu"
+
+        # assign to module-level
+        _model_places = model_places
+        _places_classes = places365_classes
+        _places_transform = places_transform
+
+        _model_clip = model_clip
+        _clip_preprocess = preprocess_clip
+        _clip_device = device
+
+    except Exception:
+        # If any of these fail, we still keep module importable and will fallback to safe behavior.
+        traceback.print_exc()
+        _model_places = None
+        _places_classes = []
+        _places_transform = None
+        _model_clip = None
+        _clip_preprocess = None
+        _clip_device = "cpu"
+    finally:
+        _models_initialized = True
+
+# ----------------- Tagging logic (uses models lazily) -----------------
+# The following functions largely mirror the behavior you had: Places365 + CLIP fusion.
+# If models are missing, we fall back to simple tags to avoid crashes.
+
+def _transform_image_places365(image_path):
+    from PIL import Image
+    if _places_transform is None:
+        return None
+    img = Image.open(image_path).convert("RGB")
+    return _places_transform(img).unsqueeze(0)  # batch dim
+
+def _predict_places365(image_tensor, topk=5):
+    import torch.nn.functional as F
     with torch.no_grad():
-        output = model_places(image_tensor)
-        probs = F.softmax(output, dim=1)
+        out = _model_places(image_tensor)
+        probs = F.softmax(out, dim=1)
         top_probs, top_idxs = probs.topk(topk)
     return top_probs.squeeze(), top_idxs.squeeze()
 
-# CLIP (on GPU if available)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_clip, preprocess_clip = clip.load("ViT-B/32", device=device)
+def _transform_image_clip(image_path):
+    from PIL import Image
+    img = Image.open(image_path).convert("RGB")
+    return _clip_preprocess(img).unsqueeze(0).to(_clip_device)
 
-def transform_image_clip(image_path: str):
-    image = Image.open(image_path).convert("RGB")
-    return preprocess_clip(image).unsqueeze(0).to(device)
-
-def weighted_scene_fusion(places_tags: List[str], clip_tags: List[str], weight_clip: float = 0.55) -> List[str]:
+def _weighted_scene_fusion(places_tags, clip_tags, weight_clip=0.55):
     score_map = {}
-    # higher rank (lower index) should produce higher score
+    # higher earlier index -> higher score (reverse ordering)
     for i, tag in enumerate(places_tags):
-        score_map[tag] = score_map.get(tag, 0.0) + (1 - weight_clip) * (len(places_tags) - i)
+        score_map[tag] = score_map.get(tag, 0) + (1 - weight_clip) * (len(places_tags) - i)
     for i, tag in enumerate(clip_tags):
-        score_map[tag] = score_map.get(tag, 0.0) + weight_clip * (len(clip_tags) - i)
-    # sort keys by score desc
-    return sorted(score_map.keys(), key=lambda k: score_map[k], reverse=True)
+        score_map[tag] = score_map.get(tag, 0) + weight_clip * (len(clip_tags) - i)
+    # return tags sorted by score descending
+    return sorted(score_map, key=score_map.get, reverse=True)
 
-custom_categories = [
-    "person", "people", "human", "portrait", "crowd",
-    "selfie", "family", "friends", "birthday", "trip",
-    "museum", "art-gallery", "vacation", "travel", "holiday",
-    "hiking", "art museum", "gallery", "exhibition", "beach",
-    "desert", "forest", "party", "wedding", "road trip",
-    "camping", "mountains", "lake"
+# A small custom categories list (you can expand)
+_custom_categories = [
+    "person", "people", "human", "portrait", "crowd", "selfie", "family", "friends",
+    "birthday", "trip", "museum", "art-gallery", "vacation", "travel", "holiday",
+    "hiking", "beach", "forest", "party", "wedding", "road trip", "camping", "mountains", "lake",
 ]
-# lowercase helper set for matching
-_custom_categories_lower = [c.lower() for c in custom_categories]
 
-places_to_custom = {
-    "art gallery": "museum",
-    "museum/indoor": "museum",
-    "exhibition room": "museum",
-    "library/indoor": "museum",
-    "beach": "beach trip",
-    "mountain": "hiking",
-    "valley": "hiking",
-    "tent/outdoor": "camping",
-    "forest/path": "hiking",
-    "desert/road": "road trip"
-}
-# lower keys for robust mapping
-_places_to_custom_lower = {k.lower(): v for k, v in places_to_custom.items()}
+# We'll use fuzzy matching only if rapidfuzz is available
+try:
+    from rapidfuzz import process as _rpf_process
+except Exception:
+    _rpf_process = None
 
-def map_to_custom_category(tags: List[str]) -> str:
-    """
-    Return best-match custom category string for the provided tags list.
-    If none match confidently, return empty string.
-    """
+def _map_to_custom_category(tags: List[str]) -> str:
+    # pick best match among tags to our custom list
     if not tags:
         return ""
+    best_match = tags[0]
     best_score = 0
-    best_match = ""
-    for tag in tags:
-        if not tag:
-            continue
-        # use rapidfuzz against our custom list
-        match, score, _ = process.extractOne(tag, custom_categories)
-        if score > best_score:
-            best_score = score
-            best_match = match
-    return best_match if best_score >= 50 else ""  # threshold
+    if _rpf_process:
+        for t in tags:
+            match, score, _ = _rpf_process.extractOne(t, _custom_categories)
+            if score > best_score:
+                best_score = score
+                best_match = match
+        return best_match
+    # fallback: return first tag
+    return best_match
 
-def combined_scene_tagging(image_path: str, topk: int = 5) -> Tuple[List[str], str]:
+def combined_scene_tagging(image_path: str, topk: int = 5) -> List[str]:
     """
-    Returns: (tags_list, final_label)
-      - tags_list: ranked fused tags (topk)
-      - final_label: mapped custom category (string)
+    Return a list of topk fused scene tags for the image.
+    Uses Places365 + CLIP fusion if available; otherwise returns simple fallback tags.
+    Models are initialized on first call.
     """
+    # lazy init
+    if not _models_initialized:
+        _init_models()
+
+    # If both models unavailable -> fallback
+    if _model_clip is None and _model_places is None:
+        # very small heuristic fallback tags
+        name = Path(image_path).stem.lower()
+        simple = []
+        if any(x in name for x in ("selfie", "portrait")):
+            simple.append("portrait")
+        if any(x in name for x in ("beach", "sea", "sand")):
+            simple.append("beach")
+        if not simple:
+            simple = ["photo"]
+        return simple[:topk]
+
+    places_tags = []
     try:
-        # Places365 (CPU)
-        img_tensor = transform_image_places365(image_path)
-        _, idxs = predict_places365(img_tensor, topk=topk)
-        # map indices -> scene names (safe indexing)
-        if isinstance(idxs, torch.Tensor):
-            idx_list = idxs.tolist()
-        else:
-            idx_list = list(idxs)
-        predicted_scenes = []
-        for idx in idx_list:
-            try:
-                predicted_scenes.append(places365_classes[int(idx)])
-            except Exception:
-                continue
-        # normalize
-        predicted_scenes = [s.lower() for s in predicted_scenes if isinstance(s, str)]
+        if _model_places is not None and _places_transform is not None and _places_classes:
+            t = _transform_image_places365(image_path)
+            if t is not None:
+                _, idxs = _predict_places365(t, topk=topk)
+                # idxs may be a tensor
+                places_tags = [_places_classes[int(i)] for i in idxs.tolist()]
+    except Exception:
+        places_tags = []
 
-        # map to custom where we have straightforward mapping
-        mapped_scenes = [_places_to_custom_lower.get(s, s) for s in predicted_scenes]
-
-        # CLIP refinement
-        all_tags = list(dict.fromkeys(mapped_scenes + _custom_categories_lower))  # preserve order, unique
-        # prepare textual prompts
-        text_prompts = [f"a photo of {t}" for t in all_tags]
-        text_inputs = clip.tokenize(text_prompts).to(device)
-        image_clip = transform_image_clip(image_path)
-
-        with torch.no_grad():
-            image_features = model_clip.encode_image(image_clip)
-            text_features = model_clip.encode_text(text_inputs)
-
+    clip_tags = []
+    try:
+        if _model_clip is not None and _clip_preprocess is not None:
+            # build candidate texts from union of places_tags and custom categories
+            all_tags = list(dict.fromkeys((places_tags or []) + _custom_categories))
+            text_inputs = _model_clip.tokenize([f"a photo of {tag}" for tag in all_tags]).to(_clip_device)
+            image_clip = _transform_image_clip(image_path)
+            with __import__("torch").no_grad():
+                image_features = _model_clip.encode_image(image_clip)
+                text_features = _model_clip.encode_text(text_inputs)
             image_features /= image_features.norm(dim=-1, keepdim=True)
             text_features /= text_features.norm(dim=-1, keepdim=True)
-
             similarity = (image_features @ text_features.T).squeeze(0)
-            top_sim_values, top_sim_idxs = similarity.topk(min(topk, len(all_tags)))
-            clip_tags = [all_tags[i] for i in top_sim_idxs.tolist()]
+            top_sim_values, top_sim_idxs = similarity.topk(topk)
+            clip_tags = [all_tags[int(i)] for i in top_sim_idxs.tolist()]
+    except Exception:
+        clip_tags = []
 
-        # fuse
-        fused = weighted_scene_fusion(mapped_scenes, clip_tags, weight_clip=0.55)
-        fused_topk = fused[:topk]
+    # If we have no tags from either, fallback
+    if not places_tags and not clip_tags:
+        return ["photo"]
 
-        # final mapped label (map fused tags to our friendly custom category)
-        final_label = map_to_custom_category(fused_topk)
-        return fused_topk, final_label
-    except Exception as e:
-        print(f"⚠️ combined_scene_tagging failed for {image_path}: {e}")
-        return [], ""
+    fused = _weighted_scene_fusion(places_tags or [], clip_tags or [], weight_clip=0.55)
+    # deduplicate preserve order
+    seen = set()
+    out = []
+    for t in fused:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= topk:
+            break
+    # Map to custom category for single-label decisions if needed (not used here)
+    return out[:topk]
 
-def add_scene_tags(metadata: Dict[str, Any], folder_path: str | Path) -> Dict[str, Any]:
+# ----------------- File helpers -----------------
+def _load_existing_metadata(photo_dir: Path) -> Dict[str, Any]:
     """
-    Iterate over metadata keys and write:
-      - metadata[image]['tags'] = [tag1, tag2, ...]
-      - metadata[image]['label'] = final_label (single string)
+    Prefer organized_output/metadata.json (produced by main.py).
+    If missing, try uploaded_photos/metadata.json, otherwise build minimal metadata
+    by listing image filenames.
     """
-    folder_path = Path(folder_path)
-    if not folder_path.exists():
-        print(f"⚠️ add_scene_tags: folder_path does not exist: {folder_path}")
-        # still ensure metadata has tags keys
-        for k in metadata.keys():
-            v = metadata.get(k)
-            if not isinstance(v, dict):
-                metadata[k] = {"datetime": v}
-            metadata[k].setdefault("tags", [])
-            metadata[k].setdefault("label", "")
-        return metadata
-
-    for image_name in list(metadata.keys()):
-        image_path = folder_path / image_name
-        # ensure dict
-        if not isinstance(metadata.get(image_name), dict):
-            metadata[image_name] = {"datetime": metadata.get(image_name)}
+    # prefer METADATA_FILE_PREF if it exists
+    if METADATA_FILE_PREF.exists():
         try:
-            if not image_path.exists():
-                # no image file, set empty tags
-                metadata[image_name]["tags"] = []
-                metadata[image_name]["label"] = ""
-                print(f"⚠️ image not found, skipping: {image_name}")
-                continue
+            with open(METADATA_FILE_PREF, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
 
-            tags, label = combined_scene_tagging(str(image_path), topk=5)
-            metadata[image_name]["tags"] = tags
-            metadata[image_name]["label"] = label
-            print(f"✅ Tagged {image_name}: label={label}, tags={tags}")
-        except Exception as e:
-            print(f"⚠️ Failed to tag {image_name}: {e}")
-            metadata[image_name].setdefault("tags", [])
-            metadata[image_name].setdefault("label", "")
+    # fallback: check photo_dir / "metadata.json"
+    m2 = photo_dir / "metadata.json"
+    if m2.exists():
+        try:
+            with open(m2, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    # final fallback: build minimal metadata from files found in photo_dir
+    meta = {}
+    for p in sorted(photo_dir.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            continue
+        meta[p.name] = {
+            "datetime": None,
+            "exif": {},
+            "lat": None,
+            "lon": None,
+        }
+    return meta
+
+# ----------------- Core function exported to main.py -----------------
+def add_scene_tags(metadata: Dict[str, Any], photo_dir: str | Path, topk: int = 5, save_path: str | Path = None) -> Dict[str, Any]:
+    """
+    Merge scene tags into an existing metadata dict.
+    - metadata: dict keyed by filename (may be dict or str). This function will ensure each entry is a dict
+                and will set/update entry['tags'] = [...tags...].
+    - photo_dir: folder where images live (used to locate files)
+    - topk: number of tags per image
+    - save_path: if provided, write merged metadata JSON to this path. If None, defaults to organized_output/metadata_with_tags.json
+    Returns the updated metadata dict.
+    """
+    photo_dir = Path(photo_dir)
+    if save_path is None:
+        save_path = DEFAULT_OUTPUT_FILE
+    else:
+        save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # normalize metadata dict: ensure per-file dict
+    for k, v in list(metadata.items()):
+        if isinstance(v, dict):
+            v.setdefault("tags", [])
+        else:
+            metadata[k] = {"datetime": v, "tags": []}
+
+    # For filenames in metadata, compute tags
+    for fname in sorted(metadata.keys()):
+        try:
+            img_path = photo_dir / fname
+            if not img_path.exists():
+                # try case-insensitive match in folder
+                found = None
+                for p in photo_dir.iterdir():
+                    if p.is_file() and p.name.lower() == fname.lower():
+                        found = p
+                        break
+                if found:
+                    img_path = found
+                else:
+                    # file not found; leave tags as-is (empty or existing)
+                    continue
+
+            tags = combined_scene_tagging(str(img_path), topk=topk)
+            # ensure serializable list
+            tags = [str(t) for t in tags]
+            entry = metadata.get(fname)
+            if entry is None:
+                metadata[fname] = {"datetime": None, "tags": tags}
+            else:
+                if not isinstance(entry, dict):
+                    metadata[fname] = {"datetime": entry, "tags": tags}
+                else:
+                    entry["tags"] = tags
+
+        except Exception:
+            # don't fail on single-file errors; print and continue
+            print(f"⚠️ Tagging failed for {fname}:", file=sys.stderr)
+            traceback.print_exc()
+
+    # persist merged metadata
+    try:
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+    except Exception:
+        print(f"⚠️ Failed to write tags file to {save_path}", file=sys.stderr)
+        traceback.print_exc()
 
     return metadata
 
-# CLI usage for standalone testing
+# ----------------- CLI / standalone behavior -----------------
+def _cli_main():
+    """
+    Usage:
+      python scene_tags.py [uploaded_photos_folder] [organized_output_folder]
+    If folders are omitted it uses configured UPLOAD_DIR and OUTPUT_DIR.
+    """
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("photo_dir", nargs="?", default=str(UPLOAD_DIR), help="Folder with uploaded photos")
+    parser.add_argument("--out", "-o", default=str(OUTPUT_DIR), help="organized_output folder where metadata.json lives and metadata_with_tags.json will be written")
+    parser.add_argument("--topk", type=int, default=5)
+    args = parser.parse_args()
+
+    photo_dir = Path(args.photo_dir)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_path = out_dir / "metadata_with_tags.json"
+
+    # Try to load base metadata produced by main.py; otherwise create minimal metadata
+    metadata = _load_existing_metadata(photo_dir)
+    print(f"Found {len(metadata)} entries in base metadata. Running tagging (topk={args.topk})...")
+
+    metadata = add_scene_tags(metadata, photo_dir, topk=args.topk, save_path=save_path)
+    print(f"\n✅ Tags saved to {save_path}")
+
 if __name__ == "__main__":
-    folder = Path(os.getenv("/Applications/portfolio-projects/smart-photo-organizer/organized_output/Sabzevar,_Iran_2023-07-26_1/IMG_6832"))
-    # output_file = folder / "metadata_with_tags.json"
-    tags_data = {}
-    print(tags_data)
-
-    # if not folder.exists():
-    #     print(f"Folder not found: {folder}")
-    # else:
-    #     for image_path in folder.glob("*.[jp][pn]g"):
-    #         try:
-    #             t, lbl = combined_scene_tagging(str(image_path), topk=5)
-    #             tags_data[image_path.name] = {"tags": t, "label": lbl}
-    #         except Exception as e:
-    #             print(f"Error {image_path}: {e}")
-    #             tags_data[image_path.name] = {"tags": [], "label": ""}
-
-    #     with open(output_file, "w", encoding="utf-8") as f:
-    #         json.dump(tags_data, f, indent=4, ensure_ascii=False)
-    #     print(f"Saved tags to {output_file}")
+    _cli_main()
