@@ -37,19 +37,32 @@ An AI-powered photo organizer that automatically analyzes your images, tags them
 smart-photo-organizer/
 ├── app/
 │   ├── ui.py                   # Streamlit app
-│   ├── scene_tags.py           # Tagging pipeline (Places365 + CLIP)
-│   ├── utils/metadata.py       # JSON serialization helpers
-│   └── utils/categories_places365.txt
+│   ├── main.py
+│   └──  utils/
+│       ├── categories_places365.txt
+│       ├── geocode.py
+│       ├── metadata.py
+│       ├── scene_tags.py
+│       └── zip_utils.py 
+│
+│   └──  expermental/
+│       └── face-recognition.py
+│
+│   └──  detectors/
+│       ├── face_detection.py
+│       └── object_detection.py
+│
 ├── models/
+│   ├── yolov8n.pt
 │   └── wideresnet18_places365.pth.tar   # Pretrained Places365 weights
+│
 ├── uploaded_photos/            # Input folder (user photos)
 ├── organized_output/           # Output folder (tagged + organized photos)
+├── pyproject.toml
+├── uv.lock
 ├── requirements.txt
 └── README.md
 ```
-
----
-
 ## ⚡ Installation
 
 1. **Clone this repo**
